@@ -15,6 +15,13 @@
 
 ``GET  /api/drafts/{draft_id}/pattern.png``
     领取正式纹版 PNG；仅当草案已证最优且与当前全部色点一致时放行。
+    响应头 ``X-Pattern-Id`` 为由单元尺寸与逐格颜色决定的纹版标识，
+    放大下载（任意 scale）使用同一标识。
+
+``POST /api/drafts/{draft_id}/acceptance``
+    试织带验收：传入领图标识、试织 PNG 与重纬/漏纬次数上限，
+    动态规划求最低分对齐（不枚举完整路径），返回最低总分与
+    放行/返工/复查判定，各附一条达标/超限最低分对齐示例。
 
 ``GET  /health``
     健康检查。
@@ -29,6 +36,15 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
+from .acceptance import (
+    STEP_KINDS,
+    VERDICT_LABELS,
+    AcceptanceResult,
+    Alignment,
+    evaluate_trial,
+    parse_trial,
+    pattern_identifier,
+)
 from .images import (
     ImageValidationError,
     MAX_UNIT,
@@ -92,6 +108,47 @@ async def _image_validation_handler(_request, exc: ImageValidationError):
 class ConflictError(HTTPException):
     def __init__(self, detail: dict):
         super().__init__(status_code=409, detail=detail)
+
+
+def _load_claimable_pattern(draft_id: int) -> tuple:
+    """取当前可领取的正式纹版：已证最优、与当前全部色点一致。
+
+    返回 ``(row, grid, pattern_id)``；不满足任一条件时抛 409，
+    并在错误体中提示重新领取后再试织。
+    """
+    row = store().get_draft(draft_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail={
+            "error": "not_found", "message": f"草案 {draft_id} 不存在"})
+
+    if row["status"] != STATUS_OPTIMAL:
+        raise ConflictError({
+            "error": "not_optimal",
+            "message": "草案尚未证明最优，正式纹版当前不可领取，请重领后重新试织",
+            "draft_id": draft_id,
+            "status": row["status"],
+        })
+
+    grid = DraftStore.decode_grid(row["grid"])
+    fixed = DraftStore.decode_points(row["fixed_points"])
+    assert grid is not None
+
+    mismatches = [
+        {"cell": {"x": x, "y": y}, "expected": list(color),
+         "actual": list(grid[y][x])}
+        for (x, y), color in sorted(fixed.items())
+        if grid[y][x] != color
+    ]
+    if mismatches:
+        raise ConflictError({
+            "error": "point_mismatch",
+            "message": "纹版与当前色点不一致，正式纹版当前不可领取，"
+                       "请重领后重新试织",
+            "draft_id": draft_id,
+            "mismatches": mismatches,
+        })
+
+    return row, grid, pattern_identifier(row["unit_w"], row["unit_h"], grid)
 
 
 # --------------------------------------------------------------------------- #
@@ -169,6 +226,9 @@ def _solve_payload(
     if draft_id is not None:
         payload["draft_id"] = draft_id
         payload["pattern_url"] = f"/api/drafts/{draft_id}/pattern.png"
+        if result.grid is not None:
+            payload["pattern_id"] = pattern_identifier(
+                unit_w, unit_h, result.grid)
     return payload
 
 
@@ -303,7 +363,14 @@ async def get_draft(draft_id: int = Path(..., ge=1)):
     if row is None:
         raise HTTPException(status_code=404, detail={
             "error": "not_found", "message": f"草案 {draft_id} 不存在"})
-    return store().row_to_dict(row)
+    payload = store().row_to_dict(row)
+    # 正式纹版可领取时附上当前纹版标识（与下载响应头同源）
+    if row["status"] == STATUS_OPTIMAL and row["grid"]:
+        grid = DraftStore.decode_grid(row["grid"])
+        assert grid is not None
+        payload["pattern_id"] = pattern_identifier(
+            row["unit_w"], row["unit_h"], grid)
+    return payload
 
 
 @app.get("/api/drafts/{draft_id}/pattern.png")
@@ -311,37 +378,7 @@ async def get_pattern(
     draft_id: int = Path(..., ge=1),
     scale: int = Query(1, ge=1, le=40, description="输出放大倍数"),
 ):
-    row = store().get_draft(draft_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail={
-            "error": "not_found", "message": f"草案 {draft_id} 不存在"})
-
-    if row["status"] != STATUS_OPTIMAL:
-        raise HTTPException(status_code=409, detail={
-            "error": "not_optimal",
-            "message": "草案尚未证明最优，不能领取正式纹版",
-            "draft_id": draft_id,
-            "status": row["status"],
-        })
-
-    grid = DraftStore.decode_grid(row["grid"])
-    fixed = DraftStore.decode_points(row["fixed_points"])
-    assert grid is not None
-
-    # 正式纹版必须符合当前全部色点
-    mismatches = [
-        {"cell": {"x": x, "y": y}, "expected": list(color),
-         "actual": list(grid[y][x])}
-        for (x, y), color in sorted(fixed.items())
-        if grid[y][x] != color
-    ]
-    if mismatches:
-        raise HTTPException(status_code=409, detail={
-            "error": "point_mismatch",
-            "message": "纹版与当前色点不一致，拒绝发放",
-            "draft_id": draft_id,
-            "mismatches": mismatches,
-        })
+    row, grid, pid = _load_claimable_pattern(draft_id)
 
     png = grid_to_png(grid, scale=scale)
     return Response(
@@ -351,5 +388,122 @@ async def get_pattern(
                 f'attachment; filename="pattern_{draft_id}.png"'),
             "X-Draft-Id": str(draft_id),
             "X-Pattern-Score": str(row["score"]),
+            # 纹版标识：由单元尺寸与逐格颜色决定，放大下载也保持同一标识
+            "X-Pattern-Id": pid,
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# 试织带验收
+# --------------------------------------------------------------------------- #
+
+def _nonnegative_limit(raw: str, field: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ImageValidationError(f"{field} 必须是非负整数，收到 {raw!r}") from exc
+    if value < 0:
+        raise ImageValidationError(f"{field} 必须是非负整数，收到 {value}")
+    return value
+
+
+def _repick_error(draft_id: int, submitted: str, current: Optional[str]) -> dict:
+    return {
+        "error": "pattern_repick_required",
+        "message": "正式纹版不可领取或与提交的纹版标识不一致，请重新领取后再试织",
+        "draft_id": draft_id,
+        "submitted_pattern_id": submitted,
+        "current_pattern_id": current,
+    }
+
+
+def _alignment_payload(alignment: Alignment,
+                       max_double_weft: int, max_missing_weft: int) -> dict:
+    return {
+        "start_pattern_row": alignment.start_row,
+        "steps": list(alignment.steps),
+        "step_kinds": [STEP_KINDS[s] for s in alignment.steps],
+        "total_score": alignment.total_score,
+        "score_breakdown": {
+            "color_mismatch": alignment.mismatch_score,
+            "double_weft": alignment.double_weft,
+            "missing_weft": alignment.missing_weft,
+        },
+        "limits": {
+            "max_double_weft": max_double_weft,
+            "max_missing_weft": max_missing_weft,
+        },
+        "within_limits": (
+            alignment.double_weft <= max_double_weft
+            and alignment.missing_weft <= max_missing_weft),
+    }
+
+
+@app.post("/api/drafts/{draft_id}/acceptance")
+async def accept_trial(
+    draft_id: int = Path(..., ge=1),
+    pattern_id: str = Form(
+        ..., description="领图时拿到的纹版标识（X-Pattern-Id 响应头）"),
+    trial: UploadFile = File(..., description="试织 PNG，与单元等宽、高 2～64 像素"),
+    max_double_weft: str = Form(
+        ..., description="重纬次数上限（非负整数）"),
+    max_missing_weft: str = Form(..., description="漏纬次数上限（非负整数）"),
+):
+    # 与 color 字段一致：非法/负数统一走 ImageValidationError -> 400
+    limit_double = _nonnegative_limit(max_double_weft, "max_double_weft")
+    limit_missing = _nonnegative_limit(max_missing_weft, "max_missing_weft")
+
+    # 受理时：正式纹版必须可领取，且与提交的标识一致
+    try:
+        row, grid, current_id = _load_claimable_pattern(draft_id)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise ConflictError(_repick_error(draft_id, pattern_id, None)) from exc
+        raise
+    if pattern_id != current_id:
+        raise ConflictError(
+            _repick_error(draft_id, pattern_id, current_id))
+
+    trial_image = parse_trial(await trial.read(), row["unit_w"])
+    result: AcceptanceResult = evaluate_trial(
+        grid, trial_image, limit_double, limit_missing)
+
+    # 出结果时再次核对：验收期间允许补录色点，但纹版可能已变化或变得
+    # 不可领取；任一情况都要求重新领取后再试织
+    try:
+        _row2, _grid2, current_id2 = _load_claimable_pattern(draft_id)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise ConflictError(
+                _repick_error(draft_id, pattern_id, None)) from exc
+        raise
+    if pattern_id != current_id2:
+        raise ConflictError(
+            _repick_error(draft_id, pattern_id, current_id2))
+
+    payload = {
+        "draft_id": draft_id,
+        "pattern_id": current_id2,
+        "verdict": result.verdict,
+        "verdict_label": VERDICT_LABELS[result.verdict],
+        "min_total_score": result.min_score,
+        "limits": {
+            "max_double_weft": limit_double,
+            "max_missing_weft": limit_missing,
+        },
+        "trial_image": {
+            "width": trial_image.width,
+            "height": trial_image.height,
+            "visible_pixels": trial_image.visible_count,
+        },
+        "passing_alignment": (
+            _alignment_payload(result.passing_alignment,
+                               limit_double, limit_missing)
+            if result.passing_alignment is not None else None),
+        "failing_alignment": (
+            _alignment_payload(result.failing_alignment,
+                               limit_double, limit_missing)
+            if result.failing_alignment is not None else None),
+    }
+    return payload

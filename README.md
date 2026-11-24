@@ -1,23 +1,27 @@
-# 提花织带纹版修复 API
+# 提花织带纹版修复与试织验收 API
 
 根据同系列**参考 PNG** 与用透明像素标注缺损的**残片 PNG**，补出可反复织造的
-重复单元纹版。技术栈：FastAPI + Pillow + OR-Tools CP-SAT（含内置回溯兜底）+ SQLite。
+重复单元纹版；并对试织带做**漏纬/重纬双上限验收**。技术栈：FastAPI + Pillow
++ OR-Tools CP-SAT（含内置回溯兜底）+ SQLite。
 
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── images.py    # PNG 解析/校验、周期投影、2×2 图块统计
-│   ├── solver.py    # CP-SAT 可行性 + 局部搜索优化 + 回溯兜底
-│   ├── storage.py   # 草案 SQLite 持久化
-│   └── main.py      # FastAPI 路由
+│   ├── images.py      # PNG 解析/校验、周期投影、2×2 图块统计
+│   ├── acceptance.py  # 试织图解析、纹版标识、最低分对齐 DP 与验收判定
+│   ├── solver.py      # CP-SAT 可行性 + 局部搜索优化 + 回溯兜底
+│   ├── storage.py     # 草案 SQLite 持久化
+│   └── main.py        # FastAPI 路由
 ├── tests/
-│   └── test_app.py  # 26 个单元/端到端测试
+│   ├── test_app.py          # 26 个原有单元/端到端测试
+│   └── test_acceptance.py   # 验收特性 16 个测试
 ├── demo/
-│   ├── make_demo_data.py   # 生成演示 PNG
-│   ├── demo_requests.sh    # 可直接运行的 curl 演示
-│   └── *.png               # 演示图片
+│   ├── make_demo_data.py    # 生成演示 PNG（含试织带）
+│   ├── make_trial_png.py    # 按已建草案现场生成复查场景试织带
+│   ├── demo_requests.sh     # 可直接运行的 curl 演示
+│   └── *.png                # 演示图片
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -84,7 +88,54 @@ multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit
 
 ### `GET /api/drafts/{id}/pattern.png?scale=1`
 领取正式纹版 PNG。仅当草案**已证最优**且纹版**符合当前全部色点**时放行，
-否则 `409`。
+否则 `409`。响应头 `X-Pattern-Id` 为**纹版标识**：由单元尺寸与逐格颜色做
+SHA-256 得到，与放大倍数无关——任意 `scale` 的放大下载返回同一标识。
+
+### `POST /api/drafts/{id}/acceptance`
+试织带开批验收。multipart 表单：
+
+| 字段 | 含义 |
+|------|------|
+| `pattern_id` | 领图时响应头 `X-Pattern-Id` 拿到的纹版标识 |
+| `trial` | 试织 PNG：与单元**等宽**、左边对准首列，高 **2～64** 像素 |
+| `max_double_weft` | 重纬次数上限（非负整数） |
+| `max_missing_weft` | 漏纬次数上限（非负整数） |
+
+**对齐与计分**：起始纹版行不限；相邻试织行在纹版上循环前进 `0/1/2` 行，
+分别表示**重纬/正常/漏纬**。每个颜色不符的可见像素计 1 分，每处重纬或漏纬
+各计 1 分；透明像素按原规则忽略（alpha < 128），全透明图退回 `400`。
+
+**判定**（只看全局最低分对齐集合）：
+
+| 判定 | 条件 | 返回字段 |
+|------|------|----------|
+| `pass` 放行 | 存在一条最低分对齐同时满足两项上限 | `passing_alignment` |
+| `rework` 返工 | 每条最低分对齐都至少超一项 | `failing_alignment` |
+| `review` 复查 | 达标与超限的最低分对齐都存在 | 两者都返回 |
+
+响应含 `min_total_score`、`verdict`，以及示例对齐的**起始纹版行**、
+**每步行数**（`steps`，0/1/2）与步长含义（`step_kinds`）、计分明细
+（颜色不符/重纬/漏纬各多少）和是否在上限内。
+
+**求解不枚举完整路径**：完整路径共 `H·3^(K-1)` 条。实现用三层动态规划——
+标量最低分 DP + 紧边前驱、紧边上的 `(重纬,漏纬)` 标签 DP（Pareto 剪枝、
+计数封顶）判达标对齐、紧边最大计数 DP 判超限对齐，状态数 `O(K·H)`。
+
+**受理与出结果两次核对**：受理时和出结果前都要求正式纹版可领取且与提交的
+`pattern_id` 一致；验收期间可继续补录色点，但若纹版变化导致标识不一致，
+返回 `409 pattern_repick_required`，提示重新领取后再试织。
+
+## 验收判定示例
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/drafts/1/acceptance \
+    -F "trial=@demo/trial_double_weft.png;type=image/png" \
+    -F "pattern_id=sha256:0496..." \
+    -F "max_double_weft=0" -F "max_missing_weft=0"
+# -> {"verdict":"rework", "min_total_score":1,
+#     "failing_alignment":{"start_pattern_row":0,"steps":[0],
+#                          "step_kinds":["double_weft"], ...}}
+```
 
 ## 求解器设计（三层）
 
@@ -102,3 +153,7 @@ multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit
 pip install pytest httpx
 python -m pytest tests/ -v
 ```
+
+共 42 个测试：原有 26 个纹版修复测试 + 16 个验收测试（试织图校验、纹版标识、
+DP 与暴力枚举一致性、放行/复查/返工三种判定、受理与出结果两次标识核对、
+纹版变为不可领取、补录色点后验收）。

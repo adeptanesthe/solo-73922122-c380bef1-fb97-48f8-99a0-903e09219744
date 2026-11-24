@@ -8,6 +8,10 @@
 * ``fragment_checker.png``   棋盘格残片
 * ``reference_conflict.png`` 6×6 参考图，用于制造同格异色冲突
 * ``fragment_conflict.png``  周期投影后同格异色的残片
+* ``trial_perfect.png``      与竖条纹纹版前两行一致的完美试织带（4 宽 2 行）
+* ``trial_double_weft.png``  含重纬缺陷的试织带（两行相同，正常行进会错色）
+* ``reference_hstripes.png`` 8×8 横向条纹参考图（相邻行异色，验收演示用）
+* ``fragment_hstripes.png``  横向条纹残片
 
 直接执行：``python demo/make_demo_data.py``
 """
@@ -15,7 +19,6 @@
 from __future__ import annotations
 
 import os
-from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -91,6 +94,58 @@ def conflict_artifacts(size: int = 6) -> tuple[Image.Image, Image.Image]:
     return ref, frag
 
 
+def trial_perfect(unit_w: int = 4) -> Image.Image:
+    """完美试织带：两行即横向条纹纹版的前两行（红行、蓝行），正常行进 0 分。"""
+    img = Image.new("RGBA", (unit_w, 2))
+    for x in range(unit_w):
+        img.putpixel((x, 0), RED)
+        img.putpixel((x, 1), BLUE)
+    return img
+
+
+def trial_with_hole(unit_w: int = 4) -> Image.Image:
+    """带透明缺损像素的试织带，演示透明像素被忽略。"""
+    img = trial_perfect(unit_w)
+    img.putpixel((1, 0), TRANSPARENT)
+    img.putpixel((2, 1), TRANSPARENT)
+    return img
+
+
+def trial_double_weft(unit_w: int = 4) -> Image.Image:
+    """两行完全相同（均为纯红行）的试织带：对横向条纹纹版，正常行进对准
+    蓝行有 unit_w 个错色，重纬对准红行只罚 1 分 -> 最低分对齐是重纬，
+    (0,0) 上限下返工；放宽重纬上限后放行。"""
+    img = Image.new("RGBA", (unit_w, 2))
+    for x in range(unit_w):
+        img.putpixel((x, 0), RED)
+        img.putpixel((x, 1), RED)
+    return img
+
+
+def horizontal_stripes_reference(size: int = 8) -> Image.Image:
+    """横向条纹参考图：相邻行颜色不同（红行/蓝行交替），用于验收演示。
+
+    这种纹版里相邻纹版行异色，试织两行相同才能体现重纬/漏纬罚分与
+    颜色错色之间的权衡，从而演示放行/复查/返工三种判定。
+    """
+    img = Image.new("RGBA", (size, size))
+    for y in range(size):
+        for x in range(size):
+            img.putpixel((x, y), RED if y % 2 == 0 else BLUE)
+    return img
+
+
+def horizontal_stripes_fragment(size: int = 8) -> Image.Image:
+    """横向条纹残片：挖掉右下四分之一与若干零散格。"""
+    img = horizontal_stripes_reference(size)
+    for y in range(size // 2, size):
+        for x in range(size // 2, size):
+            img.putpixel((x, y), TRANSPARENT)
+    for x, y in [(1, 1), (3, 2)]:
+        img.putpixel((x, y), TRANSPARENT)
+    return img
+
+
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     artifacts = [
@@ -98,6 +153,11 @@ def main() -> None:
         (stripes_fragment(), "fragment_stripes.png"),
         (checker_reference(), "reference_checker.png"),
         (checker_fragment(), "fragment_checker.png"),
+        (trial_perfect(), "trial_perfect.png"),
+        (trial_with_hole(), "trial_with_hole.png"),
+        (trial_double_weft(), "trial_double_weft.png"),
+        (horizontal_stripes_reference(), "reference_hstripes.png"),
+        (horizontal_stripes_fragment(), "fragment_hstripes.png"),
     ]
     ref_conflict, frag_conflict = conflict_artifacts()
     artifacts.append((ref_conflict, "reference_conflict.png"))

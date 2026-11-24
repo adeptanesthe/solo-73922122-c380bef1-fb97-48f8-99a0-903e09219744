@@ -4,8 +4,9 @@ import sys
 
 from PIL import Image
 
-from app import images, solver
+from app import acceptance, images, solver
 from tests.test_app import png_bytes, stripes_grid, checker_grid
+from tests.test_acceptance import trial_png
 
 RED = (220, 60, 60)
 BLUE = (60, 90, 220)
@@ -106,5 +107,93 @@ bt = solver._solve_backtrack(ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5
 cp = solver._solve_cpsat(ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5.0)
 check("回溯/CP-SAT 最优性一致", bt.status == cp.status == solver.STATUS_OPTIMAL)
 check("回溯/CP-SAT 得分一致", bt.score == cp.score)
+
+# ---- 试织验收（新增） ----
+A, B, C = RED, BLUE, GREEN
+
+# 13. 试织图校验：等宽、高度 2~64、全透明退回
+ok_w = False
+try:
+    acceptance.parse_trial(trial_png([[A, A, A], [A, A, A]]), unit_w=4)
+except images.ImageValidationError:
+    ok_w = True
+check("试织图必须与单元等宽", ok_w)
+ok_h = False
+try:
+    acceptance.parse_trial(trial_png([[A] * 4]), unit_w=4)
+except images.ImageValidationError:
+    ok_h = True
+check("试织图高度下限 2", ok_h)
+ok_t = False
+try:
+    acceptance.parse_trial(
+        trial_png([[None] * 4, [None] * 4]), unit_w=4)
+except images.ImageValidationError:
+    ok_t = True
+check("全透明试织图退回", ok_t)
+check("试织图高度上限 64",
+      acceptance.parse_trial(trial_png([[A] * 4 for _ in range(64)]), 4).height == 64)
+
+# 14. 透明像素忽略
+tr = acceptance.parse_trial(
+    trial_png([[A, None, A, None], [None, B, None, B]]), 4)
+check("透明像素不计可见点", tr.visible_count == 4)
+
+# 15. 纹版标识由单元尺寸与逐格颜色决定，放大不影响
+grid4 = tuple(tuple(A for _ in range(4)) for _ in range(4))
+pid = acceptance.pattern_identifier(4, 4, grid4)
+check("纹版标识稳定且为 sha256", pid == acceptance.pattern_identifier(4, 4, grid4)
+      and pid.startswith("sha256:"))
+grid_other = tuple(tuple(B if (x, y) == (0, 0) else A for x in range(4))
+                   for y in range(4))
+check("改一格颜色标识变化",
+      acceptance.pattern_identifier(4, 4, grid_other) != pid)
+
+# 16. 步长语义：0=重纬、1=正常、2=漏纬，且各自计分
+hgrid = (
+    (A, A, A, A),
+    (B, B, B, B),
+    (A, A, A, A),
+    (B, B, B, B),
+)
+perfect = acceptance.parse_trial(trial_png([[A] * 4, [B] * 4]), 4)
+r = acceptance.evaluate_trial(hgrid, perfect, 0, 0)
+check("正常行进 0 分放行", r.verdict == acceptance.VERDICT_PASS
+      and r.min_score == 0 and r.passing_alignment.steps == (1,))
+double = acceptance.parse_trial(trial_png([[A] * 4, [A] * 4]), 4)
+r2 = acceptance.evaluate_trial(hgrid, double, 0, 0)
+check("重纬最低分 1 且零容忍返工",
+      r2.verdict == acceptance.VERDICT_REWORK and r2.min_score == 1
+      and r2.failing_alignment.steps == (0,))
+r3 = acceptance.evaluate_trial(hgrid, double, 2, 2)
+check("放宽重纬上限后放行", r3.verdict == acceptance.VERDICT_PASS)
+
+# 17. 三种判定：复查 = 达标与超限最低分对齐并存
+review_grid = (
+    (A, A, A, A),
+    (B, B, B, B),
+    (B, A, A, A),
+    (B, B, B, B),
+)
+review_trial = acceptance.parse_trial(
+    trial_png([[A, A, A, A], [C, A, A, A]]), 4)
+res = acceptance.evaluate_trial(review_grid, review_trial, 1, 0)
+check("复查判定可达且两类示例齐全",
+      res.verdict == acceptance.VERDICT_REVIEW
+      and res.passing_alignment is not None
+      and res.failing_alignment is not None
+      and res.passing_alignment.total_score == res.min_score
+      and res.failing_alignment.total_score == res.min_score)
+check("示例注明起始纹版行与每步行数",
+      hasattr(res.passing_alignment, "start_row")
+      and len(res.passing_alignment.steps) == review_trial.height - 1)
+
+# 18. 不枚举完整路径：64 行试织在毫秒级完成（状态数 O(KH)）
+import time
+big_trial = acceptance.parse_trial(
+    trial_png([[A] * 4 for _ in range(64)]), 4)
+t0 = time.perf_counter()
+acceptance.evaluate_trial(hgrid, big_trial, 3, 3)
+check("64 行试织毫秒级返回（DP 非枚举）", time.perf_counter() - t0 < 1.0)
 
 print(f"\n全部 {ok} 项需求核对通过")
